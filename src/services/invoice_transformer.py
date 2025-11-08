@@ -530,20 +530,28 @@ def transform_invoice(ocr_response: Dict) -> Dict[str, Any]:
     try:
         full_text_tokens = ocr_response.get('fullText', []) or []
         
-        # Try spatial parser first (uses bounding box geometry)
+        # Try optimized extractor first (geometry + heuristics)
         try:
-            from src.services.spatial_parser import parse_ocr_fulltext
-            print("Using spatial parser (bbox-based)...")
-            result = parse_ocr_fulltext(ocr_response)
+            from src.services.invoice_extractor import extract_invoice_structured
+            print("Using optimized invoice extractor...")
+            result = extract_invoice_structured(ocr_response)
             
-            # If spatial parser found items, use it
+            # Debug: show what was extracted
+            print(f"Extractor returned: {len(result.get('items', []))} items")
             if result.get('items'):
-                print(f"Spatial parser found {len(result['items'])} items")
+                for i, item in enumerate(result['items'][:3], 1):
+                    print(f"  Item {i}: desc={item.get('description')}, hsn={item.get('hsn')}, qty={item.get('quantity')}, taxable={item.get('taxableValue')}")
+            
+            # If extractor found items, use it
+            if result.get('items'):
+                print(f"✓ Using geometry extractor result")
                 return result
             else:
-                print("Spatial parser found no items, falling back to regex parser...")
+                print("⚠ Extractor found no items, falling back to regex parser...")
         except Exception as e:
-            print(f"Spatial parser failed: {e}, falling back to regex parser...")
+            print(f"Extractor failed: {e}, falling back to regex parser...")
+            import traceback
+            traceback.print_exc()
         
         # Fallback to regex-based extraction
         full_text_str = get_full_text_string(full_text_tokens)

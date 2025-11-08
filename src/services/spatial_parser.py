@@ -1,36 +1,43 @@
 """
-Spatial Invoice Parser - Uses bounding box geometry for robust table extraction.
-Handles variable spacing and multi-column tables by analyzing token positions.
+Spatial Invoice Parser - Production-grade extraction using bounding box geometry.
+Combines geometry-based table parsing with text heuristics for maximum robustness.
+
+Architecture:
+1. Tokenize fullText with bbox positions (cx, cy, left)
+2. Group tokens into rows by y-proximity
+3. Find header row (Description, HSN, Qty, etc.)
+4. Compute column boundaries from header x-positions
+5. Assign tokens to columns and extract items
+6. Fallback to line-by-line parsing if header not found
 """
-import math
 import re
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional
 from statistics import median
 
 
 # ----------------------- 
-# Helpers for bbox math
+# Utilities
 # ----------------------- 
-def bbox_center(bbox: List[List[float]]) -> Tuple[float, float]:
+def bbox_center(bbox):
     """Get center point of bounding box."""
     xs = [p[0] for p in bbox]
     ys = [p[1] for p in bbox]
     return (sum(xs) / len(xs), sum(ys) / len(ys))
 
 
-def bbox_top(bbox: List[List[float]]) -> float:
-    """Get top y-coordinate of bounding box."""
-    return min(p[1] for p in bbox)
-
-
-def bbox_left(bbox: List[List[float]]) -> float:
+def bbox_left(bbox):
     """Get left x-coordinate of bounding box."""
     return min(p[0] for p in bbox)
 
 
-def normalize_amount(s: Optional[str]) -> Optional[float]:
+def bbox_top(bbox):
+    """Get top y-coordinate of bounding box."""
+    return min(p[1] for p in bbox)
+
+
+def normalize_amount(s):
     """Normalize amount string to float."""
-    if not s:
+    if s is None:
         return None
     s = str(s).replace('₹', '').replace(',', '').strip()
     s = re.sub(r'[^\d\.\-]', '', s)
@@ -40,103 +47,86 @@ def normalize_amount(s: Optional[str]) -> Optional[float]:
         return None
 
 
+def token_conf(token):
+    """Extract confidence from token (handles 'conf' or 'confidence' key)."""
+    return token.get("conf") or token.get("confidence") or 1.0
+
+
 # ----------------------- 
-# Build tokens + spatial index
+# Tokenize fullText (geometry-aware)
 # ----------------------- 
-def tokens_from_fulltext(fullText: List[Dict[str, Any]]) -> List[Dict]:
-    """
-    Turn OCR fullText blocks into token list with center x,y and original text.
-    """
-    tokens = []
+def tokens_from_fulltext(fullText: List[Dict]) -> List[Dict]:
+    """Convert OCR fullText to tokens with spatial coordinates."""
+    toks = []
     for b in fullText:
         txt = b.get("text", "").strip()
         bbox = b.get("bbox")
         if not txt or not bbox:
             continue
         cx, cy = bbox_center(bbox)
-        left = bbox_left(bbox)
-        tokens.append({
+        toks.append({
             "text": txt,
             "cx": cx,
             "cy": cy,
-            "left": left,
+            "left": bbox_left(bbox),
             "bbox": bbox,
-            "confidence": b.get("confidence", 0.9)
+            "conf": token_conf(b)
         })
-    # Sort top->bottom then left->right to help row grouping
-    tokens.sort(key=lambda t: (t["cy"], t["left"]))
-    return tokens
+    toks.sort(key=lambda t: (t["cy"], t["left"]))
+    return toks
 
 
 # ----------------------- 
-# Group tokens into rows by y proximity
+# Group tokens into rows
 # ----------------------- 
-def group_tokens_into_rows(tokens: List[Dict], y_tol: float = 12.0) -> List[List[Dict]]:
-    """
-    Group tokens into rows by clustering cy values. y_tol is px tolerance.
-    """
+def group_rows(tokens: List[Dict], y_tol=14.0) -> List[List[Dict]]:
+    """Group tokens into rows by y-proximity."""
     rows = []
     for t in tokens:
         if not rows:
             rows.append([t])
             continue
-        # Difference between this token's y and last row's median y
-        last_row = rows[-1]
-        last_ys = [tt["cy"] for tt in last_row]
-        med = median(last_ys)
+        med = median([x["cy"] for x in rows[-1]])
         if abs(t["cy"] - med) <= y_tol:
-            last_row.append(t)
+            rows[-1].append(t)
         else:
             rows.append([t])
-    # Sort tokens in each row left->right
     for r in rows:
         r.sort(key=lambda x: x["left"])
     return rows
 
 
 # ----------------------- 
-# Find header row (common headers)
+# Find header row
 # ----------------------- 
-HEADER_KEYWORDS = [
-    "description", "description of goods", "item name", "hsn", "hsn/sac",
-    "qty", "quantity", "rate", "unit price", "amount", "taxable", "amount (incl",
-    "sl", "s.no", "sr.no"
-]
+HEADER_KEYWORDS = ["description", "hsn", "hsn/sac", "quantity", "qty", "rate", "unit price", "amount", "taxable"]
 
 
-def find_header_row(rows: List[List[Dict]]) -> Optional[int]:
-    """
-    Return the index of the row that most closely matches header keywords.
-    """
-    for i, row in enumerate(rows[:12]):  # Usually header near top quarter
-        txt = " ".join([t["text"].lower() for t in row])
-        score = sum(1 for k in HEADER_KEYWORDS if k in txt)
+def find_header(rows):
+    """Find header row by keyword matching."""
+    for i, row in enumerate(rows[:18]):
+        text = " ".join(t["text"].lower() for t in row)
+        score = sum(1 for k in HEADER_KEYWORDS if k in text)
         if score >= 2:
             return i
-    # Fallback: find any row containing 'hsn' or 'description' word
-    for i, row in enumerate(rows[:18]):
-        txt = " ".join([t["text"].lower() for t in row])
-        if "hsn" in txt or "description" in txt or "quantity" in txt:
+    # Fallback: any row containing 'hsn' or 'quantity'
+    for i, row in enumerate(rows[:30]):
+        txt = " ".join(t["text"].lower() for t in row)
+        if "hsn" in txt or "quantity" in txt or "rate" in txt:
             return i
     return None
 
 
 # ----------------------- 
-# Determine column boundaries from header
+# Compute column boundaries from header
 # ----------------------- 
-def compute_column_bounds_from_header(header_row: List[Dict]) -> List[Tuple[float, float]]:
-    """
-    Use header tokens x positions to create column boundaries.
-    Returns list of (x_left, x_right) for each column.
-    """
-    # Header tokens left positions
+def compute_bounds(header_row):
+    """Compute column boundaries from header token x-positions."""
     xs = [t["left"] for t in header_row]
     xs_sorted = sorted(xs)
-    # Boundaries between tokens: midpoints
     mids = []
     for a, b in zip(xs_sorted, xs_sorted[1:]):
         mids.append((a + b) / 2.0)
-    # Column boundaries: (-inf, mids[0]), (mids[0], mids[1]), ..., (mids[-1], +inf)
     bounds = []
     left = -1e6
     for m in mids:
@@ -146,44 +136,156 @@ def compute_column_bounds_from_header(header_row: List[Dict]) -> List[Tuple[floa
     return bounds
 
 
-# ----------------------- 
-# Assign tokens to columns using bounds
-# ----------------------- 
-def assign_tokens_to_columns(row: List[Dict], bounds: List[Tuple[float, float]]) -> List[List[Dict]]:
-    """Assign tokens to columns based on their x-position."""
+def assign_cols(row, bounds):
+    """Assign tokens to columns based on x-position."""
     cols = [[] for _ in bounds]
     for t in row:
         cx = t["cx"]
         placed = False
-        for idx, (l, r) in enumerate(bounds):
+        for i, (l, r) in enumerate(bounds):
             if l <= cx <= r:
-                cols[idx].append(t)
+                cols[i].append(t)
                 placed = True
                 break
         if not placed:
-            # If not fit (rare), put in closest column by distance to center boundaries
-            dists = [min(abs(cx - l), abs(cx - r)) for (l, r) in bounds]
+            # Fallback: nearest bound
+            dists = [abs(cx - (l + r) / 2.0) for (l, r) in bounds]
             cols[dists.index(min(dists))].append(t)
     return cols
 
 
-# ----------------------- 
-# Parse numeric tokens into amounts
-# ----------------------- 
-def extract_amounts_from_col(col_tokens: List[Dict]) -> Optional[float]:
-    """Extract numeric amount from column tokens."""
-    if not col_tokens:
+def col_text(col):
+    """Get text from column tokens."""
+    return " ".join(t["text"] for t in col).strip()
+
+
+def extract_amount_from_col(col):
+    """Extract numeric amount from column."""
+    txt = col_text(col)
+    m = re.findall(r"[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})", txt)
+    if not m:
+        m = re.findall(r"\d+\.\d+", txt)
+    if not m:
         return None
-    txt = " ".join([t["text"] for t in col_tokens])
-    # Find last numeric token (likely the amount)
-    matches = re.findall(r"[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?", txt)
-    if not matches:
-        # Maybe bare numbers like 6322.00
-        matches = re.findall(r"\d+\.\d+", txt)
-    if not matches:
-        return None
-    candidate = matches[-1]
-    return normalize_amount(candidate)
+    return normalize_amount(m[-1])
+
+
+# ----------------------- 
+# Fallback parser when header not found
+# ----------------------- 
+def parse_item_from_text_line(ln: str) -> Optional[Dict]:
+    """
+    Try to extract item fields from a single text line using regex heuristics.
+    Requires at least one decimal number (taxable amount) and a qty token.
+    """
+    # Normalize common separators
+    s = ln.replace("₹", " ").replace(",", "")
+    
+    # Look for qty patterns e.g. '13 PCS', '149 Bag', '2 PCS'
+    qty_m = re.search(r"(\d{1,6})\s*(PCS|Bag|KG|Nos|Pcs|BAG|PCS|KG|NOS)?\b", s, re.IGNORECASE)
+    
+    # Look for taxable/amount numbers: prefer numbers with 2 decimals
+    amounts = re.findall(r"([0-9]+\.[0-9]{2})", s)
+    
+    # Look for HSN 4-8 digits
+    hsn_m = re.search(r"\b(\d{4,8})\b", s)
+    
+    # If we have at least one decimal number and a qty: good candidate
+    if amounts and qty_m:
+        # Pick last decimal as taxableValue (common in Indian invoices)
+        taxable_candidate = amounts[-1]
+        unit_price_candidate = amounts[-2] if len(amounts) >= 2 else None
+        
+        desc = s
+        # Remove numeric tokens for cleaner description
+        desc = re.sub(r"\b" + re.escape(taxable_candidate) + r"\b", "", desc)
+        if unit_price_candidate:
+            desc = re.sub(r"\b" + re.escape(unit_price_candidate) + r"\b", "", desc)
+        # Remove qty token
+        desc = re.sub(qty_m.group(0), "", desc, flags=re.IGNORECASE).strip()
+        
+        # Remove HSN if present
+        if hsn_m:
+            desc = re.sub(r"\b" + hsn_m.group(1) + r"\b", "", desc)
+        
+        itm = {
+            "description": re.sub(r"\s{2,}", " ", desc).strip() or None,
+            "hsn": hsn_m.group(1) if hsn_m else None,
+            "quantity": f"{qty_m.group(1)} {qty_m.group(2).upper()}" if qty_m.group(2) else qty_m.group(1),
+            "unitPrice": normalize_amount(unit_price_candidate) if unit_price_candidate else None,
+            "taxableValue": normalize_amount(taxable_candidate),
+        }
+        
+        # GST percent if present
+        gst_m = re.search(r"@?\s*([0-9]{1,2}(?:\.[0-9])?)\s*%", s)
+        if gst_m:
+            itm["gstRate"] = float(gst_m.group(1))
+            itm["cgstRatePct"] = float(gst_m.group(1)) / 2
+            itm["sgstRatePct"] = float(gst_m.group(1)) / 2
+        
+        return itm
+    return None
+
+
+def parse_items_fallback_by_lines(rows: List[List[Dict]]) -> List[Dict]:
+    """
+    Fallback when no header found. Iterates rows and forms logical 'line groups'
+    by merging nearby lines that look like a single item (letters + numbers).
+    """
+    items = []
+    # Convert rows to plain text lines
+    txt_lines = [" ".join(t["text"] for t in r).strip() for r in rows if any(t.get("text") for t in r)]
+    # Remove very short noise lines
+    txt_lines = [ln for ln in txt_lines if len(ln) > 1]
+    
+    i = 0
+    while i < len(txt_lines):
+        ln = txt_lines[i]
+        # If line contains big numeric sums or 'Sub Total' etc, stop
+        if re.search(r"\b(Sub\s*Total|Total|Round Off|Amount Chargeable|Tax Amount)\b", ln, re.IGNORECASE):
+            break
+        
+        # Heuristic: item block likely either:
+        #  - single line with description + qty + unit + amount tokens
+        #  - or description line(s) followed by a numeric line with qty/unit/price
+        
+        # Try single-line numeric parse first
+        single = parse_item_from_text_line(ln)
+        if single:
+            items.append(single)
+            i += 1
+            continue
+        
+        # Else try to merge this line with next 1-2 lines to form an item
+        merged = ln
+        j = 1
+        merged_item = None
+        while j <= 2 and i + j < len(txt_lines):
+            merged = merged + " " + txt_lines[i + j]
+            merged_item = parse_item_from_text_line(merged)
+            if merged_item:
+                items.append(merged_item)
+                break
+            j += 1
+        
+        if merged_item:
+            i += j + 1
+            continue
+        
+        # No numeric evidence; consider it a description-only line, attach to next numeric line
+        # If next line has numbers, merge current + next
+        if i + 1 < len(txt_lines):
+            combined = ln + " " + txt_lines[i + 1]
+            combined_item = parse_item_from_text_line(combined)
+            if combined_item:
+                items.append(combined_item)
+                i += 2
+                continue
+        
+        # Fallback: skip line
+        i += 1
+    
+    return items
 
 
 # ----------------------- 
@@ -368,19 +470,35 @@ def parse_ocr_fulltext(ocr_json: Dict[str, Any]) -> Dict[str, Any]:
     tokens = tokens_from_fulltext(fullTextArr)
     rows = group_tokens_into_rows(tokens, y_tol=14.0)
     
+    # Debug: log first few rows
+    print(f"Total rows: {len(rows)}")
+    for i, row in enumerate(rows[:10]):
+        print(f"  Row {i}: {' '.join(t['text'] for t in row)}")
+    
     header_idx = find_header_row(rows)
     items = []
-    if header_idx is not None:
-        items = parse_table_rows(rows, header_idx)
     
-    # Fallback: try to find 'Item name' keyword and attempt parsing below it
+    if header_idx is not None:
+        print(f"Header found at row {header_idx}")
+        items = parse_table_rows(rows, header_idx)
+    else:
+        print("Header not found, trying keyword search...")
+    
+    # Fallback 1: try to find 'Item name' keyword and attempt parsing below it
     if not items:
         for i, row in enumerate(rows):
             txt = " ".join(t["text"].lower() for t in row)
             if "item name" in txt or "description of goods" in txt:
+                print(f"Found item keyword at row {i}")
                 items = parse_table_rows(rows, i)
                 if items:
                     break
+    
+    # Fallback 2: use line-by-line heuristic parser
+    if not items:
+        print("Using fallback line-by-line parser...")
+        items = parse_items_fallback_by_lines(rows)
+        print(f"Fallback parser found {len(items)} items")
     
     top_text, middle_text, bottom_text = extract_top_bottom_blocks(rows)
     totals = extract_totals_from_text(bottom_text + "\n" + middle_text)
