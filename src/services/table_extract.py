@@ -2,9 +2,149 @@ import numpy as np
 import cv2
 import sys
 import os
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import config
+
+
+def _parse_structure_table(structure_tables, image_bgr):
+    """Parse PP-Structure table results into line items."""
+    from src.schemas import OCRLine, OCRField, QtyField, ComputedTotals
+    from src.services.reconcile import compute_line_totals
+    
+    if not structure_tables:
+        return {"rows": [], "columns": ["description", "qty", "unitPrice", "gstRate", "hsn"], "debug": {}}
+    
+    line_items = []
+    
+    # Process first table (usually the main invoice table)
+    table = structure_tables[0]
+    cells = table.get('cells', [])
+    
+    if not cells:
+        return {"rows": [], "columns": ["description", "qty", "unitPrice", "gstRate", "hsn"], "debug": {}}
+    
+    # Group cells by row (based on y-coordinate)
+    rows_dict = {}
+    for cell in cells:
+        bbox = cell.get('bbox', [])
+        if len(bbox) >= 4:
+            y_center = (bbox[1] + bbox[3]) / 2
+            # Round to nearest 10 pixels to group rows
+            row_key = round(y_center / 10) * 10
+            if row_key not in rows_dict:
+                rows_dict[row_key] = []
+            rows_dict[row_key].append(cell)
+    
+    # Sort rows by y-coordinate
+    sorted_rows = sorted(rows_dict.items(), key=lambda x: x[0])
+    
+    # Parse each row
+    for row_idx, (y_pos, row_cells) in enumerate(sorted_rows):
+        # Sort cells by x-coordinate
+        row_cells.sort(key=lambda c: c['bbox'][0])
+        
+        # Skip header rows
+        row_text = " ".join([c.get('text', '') for c in row_cells]).lower()
+        if any(keyword in row_text for keyword in ["description", "qty", "quantity", "amount", "total", "subtotal", "s.no", "sr.no"]):
+            continue
+        
+        # Extract fields from cells
+        description_text = ""
+        hsn_text = None
+        qty_val = 0.0
+        qty_unit = None
+        price_val = 0.0
+        gst_val = 0.18
+        
+        # Heuristic: first 1-2 cells = description, then hsn, qty, price, gst
+        for col_idx, cell in enumerate(row_cells):
+            text = cell.get('text', '').strip()
+            if not text:
+                continue
+            
+            # Column 0-1: Description
+            if col_idx <= 1:
+                description_text += " " + text
+            # Column 2: HSN or Qty
+            elif col_idx == 2:
+                # Check if numeric (qty) or alphanumeric (hsn)
+                if re.search(r'^\d+$', text):
+                    hsn_text = text
+                else:
+                    nums = re.findall(r'[\d.]+', text.replace(",", ""))
+                    if nums:
+                        qty_val = float(nums[0])
+                    # Extract unit
+                    units = ["kg", "g", "bag", "piece", "pc", "pcs", "litre", "l", "ml", "meter", "m", "cm", "box", "carton"]
+                    for u in units:
+                        if u.lower() in text.lower():
+                            qty_unit = u.lower()
+                            break
+            # Column 3: Qty or Price
+            elif col_idx == 3:
+                nums = re.findall(r'[\d.]+', text.replace(",", ""))
+                if nums:
+                    val = float(nums[0])
+                    # If qty not set, this is qty
+                    if qty_val == 0.0:
+                        qty_val = val
+                    else:
+                        price_val = val
+            # Column 4: Price or GST
+            elif col_idx == 4:
+                nums = re.findall(r'[\d.]+', text.replace(",", ""))
+                if nums:
+                    val = float(nums[0])
+                    if price_val == 0.0:
+                        price_val = val
+                    else:
+                        gst_val = val / 100 if val > 1 else val
+            # Column 5+: GST or Amount
+            elif col_idx >= 5:
+                nums = re.findall(r'[\d.]+', text.replace(",", ""))
+                if nums:
+                    val = float(nums[0])
+                    # Likely GST rate
+                    if val <= 100:
+                        gst_val = val / 100 if val > 1 else val
+        
+        description_text = description_text.strip()
+        
+        # Only add if we have description and qty
+        if description_text and qty_val > 0:
+            net, tax, gross = compute_line_totals(qty_val, price_val, gst_val)
+            
+            line_items.append(OCRLine(
+                rowId=f"r{row_idx+1}",
+                description=OCRField(
+                    value=description_text,
+                    confidence=0.85,
+                    bbox=row_cells[0].get('bbox') if row_cells else None
+                ),
+                hsn=hsn_text,
+                qty=QtyField(
+                    value=qty_val,
+                    confidence=0.85,
+                    unit=qty_unit
+                ),
+                unitPrice=OCRField(
+                    value=price_val,
+                    confidence=0.85
+                ),
+                gstRate=OCRField(
+                    value=gst_val,
+                    confidence=0.85
+                ),
+                computed=ComputedTotals(net=net, tax=tax, gross=gross)
+            ))
+    
+    return {
+        "rows": line_items,
+        "columns": ["description", "hsn", "qty", "unitPrice", "gstRate"],
+        "debug": {"method": "pp_structure", "num_tables": len(structure_tables), "num_items": len(line_items)}
+    }
 
 
 def _detect_table_regions(image_bgr):
@@ -218,6 +358,16 @@ def _parse_line_item(tokens, column_centers):
 
 def extract_table(tokens, image_bgr):
     """Extract table structure and parse line items."""
+    # Try PP-Structure first if enabled
+    if config.USE_PP_STRUCTURE:
+        from src.services.ocr_engine import extract_table_with_structure
+        structure_tables = extract_table_with_structure(image_bgr)
+        
+        if structure_tables:
+            # Use PP-Structure results
+            return _parse_structure_table(structure_tables, image_bgr)
+    
+    # Fallback to heuristic method
     # Filter out header tokens (top 30% of image)
     h, w = image_bgr.shape[:2]
     header_threshold = h * 0.3

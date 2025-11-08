@@ -28,6 +28,7 @@ class MetaInfo(BaseModel):
 class EntityInfo(BaseModel):
     name: Optional[str] = None
     gstin: Optional[str] = None
+    address: Optional[str] = None
     confidence: float = 0.0
     bbox: Optional[List[List[float]]] = None
 
@@ -89,6 +90,14 @@ class Warning(BaseModel):
     score: Optional[float] = None
 
 
+class FullTextToken(BaseModel):
+    text: str
+    confidence: float
+    bbox: List[List[float]]
+    handwritten: Optional[bool] = None
+    hw_score: Optional[float] = None
+
+
 class OCRResponse(BaseModel):
     meta: MetaInfo = Field(default_factory=lambda: MetaInfo())
     seller: Optional[EntityInfo] = None
@@ -97,4 +106,5 @@ class OCRResponse(BaseModel):
     lines: List[OCRLine] = Field(default_factory=list)
     totals: Optional[TotalsInfo] = None
     warnings: List[Warning] = Field(default_factory=list)
+    fullText: Optional[List[FullTextToken]] = Field(default=None, description="All extracted text tokens with positions")
 

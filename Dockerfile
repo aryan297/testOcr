@@ -1,47 +1,51 @@
-FROM python:3.11-slim as builder
+# ---------- Builder ----------
+FROM python:3.11-slim AS builder
+ARG DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies including SWIG for PyMuPDF
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    gcc \
-    g++ \
-    make \
-    swig \
-    pkg-config \
-    libssl-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config wget \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_PREFER_BINARY=1
 
-# Install Python dependencies
+WORKDIR /app
 COPY requirements.txt .
-# Upgrade pip first for better wheel support and install build tools
+
+# Upgrade pip stack first
 RUN pip install --upgrade pip setuptools wheel
-# Install all dependencies (PyMuPDF will build from source with available tools)
-RUN pip install --no-cache-dir --user -r requirements.txt
 
-# Final stage
-FROM python:3.11-slim
+# Install PaddleOCR WITHOUT dependencies (prevents PyMuPDF from being pulled)
+RUN pip install --no-deps paddleocr==2.7.0.3
+# CPU Paddle runtime
+RUN pip install paddlepaddle==2.6.1
 
-# Install runtime dependencies only
-RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    tesseract-ocr \
+# Now install pinned deps (opencv headless, pypdfium2, torch, transformers, etc.)
+RUN pip install -r requirements.txt
+
+# Download PP-Structure models (table detection)
+RUN mkdir -p /root/.paddleocr/whl/table && \
+    wget -q https://paddleocr.bj.bcebos.com/ppstructure/models/slanet/en_ppstructure_mobile_v2.0_SLANet_infer.tar -O /tmp/table.tar && \
+    tar -xf /tmp/table.tar -C /root/.paddleocr/whl/table && \
+    rm /tmp/table.tar
+
+# ---------- Runtime ----------
+FROM python:3.11-slim AS runtime
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 libglib2.0-0 tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /root/.paddleocr /root/.paddleocr
+ENV PATH="/opt/venv/bin:$PATH"
+
 WORKDIR /app
-
-# Copy installed packages from builder
-COPY --from=builder /root/.local /root/.local
-
-# Copy application code
 COPY . .
 
-# Make sure scripts in .local are usable
-ENV PATH=/root/.local/bin:$PATH
-
 EXPOSE 8080
-
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
+CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8080","--workers","2"]
 

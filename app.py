@@ -11,6 +11,7 @@ from src.services.table_extract import extract_table
 from src.services.layout_parser import parse_header_blocks
 from src.services.postprocess import build_response
 from src.services.dedupe import compute_hashes
+from src.services.invoice_transformer import transform_invoice
 from src.logging_conf import setup_logging
 import config
 import time
@@ -454,59 +455,124 @@ async def parse(
     try:
         # Rasterize PDF or load image
         pages_bgr = rasterize_pdf_if_needed(raw, file.content_type)
-        image_bgr = pages_bgr[0]  # First page only for now
         
-        # Assess quality
-        quality = assess_quality(image_bgr)
+        # Process all pages for PDFs, first page for images
+        all_rows = []
+        all_warnings = []
+        all_tokens = []  # Collect ALL tokens from all pages
+        header = None
+        quality = None
+        extracted_totals = None
+        hashes = compute_hashes(pages_bgr[0], raw) if pages_bgr else None
         
-        if quality["reject"]:
-            logger.warning("Image rejected due to quality issues", extra={"quality": quality})
-            from src.schemas import MetaInfo, QualityMetrics, Warning
-            return OCRResponse(
-                meta=MetaInfo(
-                    ocrConfidence=0.0,
-                    quality=QualityMetrics(**quality),
-                    duplicateLikely=False,
-                    uploadHash="",
-                    phash=""
-                ),
-                seller=None,
-                buyer=None,
-                invoice=None,
-                lines=[],
-                totals=None,
-                warnings=[Warning(code="BAD_QUALITY")]
-            )
-        
-        # Preprocess
-        image_bgr = enhance_image(image_bgr)
-        image_bgr = upscale_if_needed(image_bgr)
-        skew_angle = quality.get("skewDeg", 0.0)
-        if abs(skew_angle) > 0.5:
-            image_bgr = deskew_image(image_bgr, skew_angle)
-        
-        # Run OCR
         ocr = get_ocr()
-        tokens = ocr_tokens(ocr, image_bgr)
         
-        if not tokens:
-            logger.warning("No tokens extracted from image")
-            raise HTTPException(
-                status_code=422,
-                detail="No text detected in image"
-            )
+        for page_idx, image_bgr in enumerate(pages_bgr):
+            # Assess quality for this page
+            page_quality = assess_quality(image_bgr, content_type=file.content_type)
+            
+            # Use first page's quality for main response
+            if page_idx == 0:
+                quality = page_quality
+            
+            # If it's a PDF, don't hard reject—just warn
+            if page_quality.get("reject") and file.content_type == "application/pdf":
+                page_quality["reject"] = False
+                all_warnings.append({"code": "LOW_QUALITY_PDF", "field": f"page_{page_idx + 1}", "score": page_quality.get("focus", 0.0)})
+                logger.warning(f"Low quality PDF page {page_idx + 1}, continuing anyway", extra={"quality": page_quality})
+            elif page_quality.get("reject") and page_idx == 0:
+                # For images, reject on first page if quality is bad
+                logger.warning("Image rejected due to quality issues", extra={"quality": page_quality})
+                from src.schemas import MetaInfo, QualityMetrics, Warning
+                return OCRResponse(
+                    meta=MetaInfo(
+                        ocrConfidence=0.0,
+                        quality=QualityMetrics(**{k: v for k, v in page_quality.items() if k != "content_type"}),
+                        duplicateLikely=False,
+                        uploadHash="",
+                        phash=""
+                    ),
+                    seller=None,
+                    buyer=None,
+                    invoice=None,
+                    lines=[],
+                    totals=None,
+                    warnings=[Warning(code="BAD_QUALITY")]
+                )
+            
+            # Preprocess
+            processed_img = enhance_image(image_bgr)
+            processed_img = upscale_if_needed(processed_img)
+            skew_angle = page_quality.get("skewDeg", 0.0)
+            if abs(skew_angle) > 0.5:
+                processed_img = deskew_image(processed_img, skew_angle)
+            
+            # Run OCR on this page
+            tokens = ocr_tokens(ocr, processed_img)
+            
+            if not tokens:
+                logger.warning(f"No tokens extracted from page {page_idx + 1}")
+                if page_idx == 0:
+                    # Only fail on first page
+                    raise HTTPException(
+                        status_code=422,
+                        detail="No text detected in image"
+                    )
+                continue
+            
+            # Collect all tokens for full text extraction
+            all_tokens.extend(tokens)
+            
+            # Parse layout (only from first page for headers)
+            if page_idx == 0:
+                header = parse_header_blocks(tokens, processed_img)
+            
+            # Extract totals from last page (usually contains final totals)
+            if page_idx == len(pages_bgr) - 1:
+                from src.services.layout_parser import extract_totals_from_tokens
+                extracted_totals = extract_totals_from_tokens(tokens, processed_img)
+            
+            # Extract table from this page
+            table = extract_table(tokens, processed_img)
+            page_rows = table.get("rows", [])
+            
+            # Add page identifier to row IDs
+            for row in page_rows:
+                if hasattr(row, 'rowId'):
+                    row.rowId = f"p{page_idx + 1}_{row.rowId}"
+            
+            all_rows.extend(page_rows)
         
-        # Parse layout
-        header = parse_header_blocks(tokens, image_bgr)
+        # Combine all rows into a single table structure
+        combined_table = {"rows": all_rows, "columns": ["description", "hsn", "qty", "unitPrice", "gstRate"], "debug": {"num_pages": len(pages_bgr), "num_items": len(all_rows)}}
         
-        # Extract table
-        table = extract_table(tokens, image_bgr)
+        # Clean quality dict before passing to build_response (remove content_type)
+        quality_clean = {k: v for k, v in (quality or {}).items() if k != "content_type"} if quality else {}
         
-        # Compute hashes
-        hashes = compute_hashes(image_bgr, raw)
+        # Add all tokens to header for full text extraction
+        if header:
+            header["allTokens"] = all_tokens
+        else:
+            header = {"allTokens": all_tokens}
         
-        # Build response
-        resp_dict = build_response(header, table, quality, hashes, raw, image_bgr)
+        # Build response with combined data (pass extracted_totals for reconciliation)
+        resp_dict = build_response(
+            header or {}, 
+            combined_table, 
+            quality_clean, 
+            hashes or {}, 
+            raw, 
+            pages_bgr[0] if pages_bgr else None,
+            extracted_totals=extracted_totals
+        )
+        
+        # Merge warnings
+        if all_warnings:
+            if "warnings" not in resp_dict:
+                resp_dict["warnings"] = []
+            from src.schemas import Warning
+            for warn in all_warnings:
+                resp_dict["warnings"].append(Warning(**warn))
         
         try:
             return OCRResponse.model_validate(resp_dict)
@@ -525,6 +591,126 @@ async def parse(
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         )
+
+
+@app.post(
+    "/ocr/parse/structured",
+    tags=["OCR"],
+    summary="Parse Invoice (Structured Format)",
+    description="""
+    Enhanced OCR parsing endpoint that returns a clean, structured invoice format.
+    
+    This endpoint:
+    1. Runs the standard OCR parse
+    2. Transforms the response into a cleaner, more structured format
+    3. Returns invoice data in a business-friendly schema
+    
+    **Output format**:
+    - invoice: Invoice number, date, acknowledgement, IRN, reference
+    - seller: Name, unit, address, GSTIN, state
+    - buyer: Name, contact, address, GSTIN, state
+    - items: Line items with description, quantity, rate, HSN, GST rates
+    - totals: Round-off, quantities, amounts, tax breakdown, amounts in words
+    - meta: Document type, computer generated flag, signatory
+    
+    **Supported file formats**: PNG, JPEG, PDF
+    """,
+    response_model=Dict[str, Any],
+    status_code=status.HTTP_200_OK,
+    responses={
+        200: {
+            "description": "Successfully parsed and structured invoice",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "invoice": {
+                            "invoiceNumber": "TPS/25-26/3050",
+                            "invoiceDate": "23-Oct-25",
+                            "acknowledgement": {
+                                "ackNo": "182520552950613",
+                                "ackDate": "24-Oct-25"
+                            },
+                            "irn": "b45b5c5dd32ab1f2a403c923cba57cfe...",
+                            "referenceNo": "3606",
+                            "referenceDate": "23-Oct-25"
+                        },
+                        "seller": {
+                            "name": "M/s Tajpuria Sales",
+                            "unit": "Unit of Shree Ram Sales LLP",
+                            "address": "Circle No-20A, Ward No-38, Koyal Kothi...",
+                            "gstin": "10ADAFS2028K1ZI",
+                            "state": "Bihar",
+                            "stateCode": "10"
+                        },
+                        "buyer": {
+                            "name": "Shree Ram Iron (Madhepura)",
+                            "contact": "Rahul Kumar, S/O Rajesh Kumar",
+                            "address": "Agrawal, Ward No-20, Subhash...",
+                            "gstin": "10FVYPK2595A1ZG",
+                            "state": "Bihar",
+                            "stateCode": "10"
+                        },
+                        "items": [
+                            {
+                                "slNo": 1,
+                                "description": "HG 8341",
+                                "quantity": "2 PCS",
+                                "rate": 755.00,
+                                "per": "PCS",
+                                "taxableValue": 1279.66,
+                                "hsn": "48239019",
+                                "cgstRate": 9,
+                                "sgstRate": 9
+                            }
+                        ],
+                        "totals": {
+                            "roundOff": 0.04,
+                            "totalQty": "17 PCS",
+                            "totalAmount": 7460.00,
+                            "taxableValue": 6322.00,
+                            "cgst": 568.98,
+                            "sgst": 568.98,
+                            "totalTax": 1137.96,
+                            "totalInWords": "INR Seven Thousand Four Hundred Sixty Only",
+                            "taxInWords": "INR One Thousand One Hundred Thirty Seven..."
+                        },
+                        "meta": {
+                            "documentType": "Tax Invoice",
+                            "isComputerGenerated": True,
+                            "authorisedSignatory": "M/s Tajpuria Sales"
+                        }
+                    }
+                }
+            }
+        }
+    }
+)
+async def parse_structured(
+    file: UploadFile = File(..., description="Invoice image (PNG/JPEG) or PDF file to process"),
+    lang: str = Form("en", description="OCR language code (e.g., 'en', 'hi')")
+):
+    """
+    Parse an invoice and return structured, business-friendly format.
+    
+    This endpoint wraps the standard /ocr/parse endpoint and transforms
+    the response into a cleaner, more structured format suitable for
+    business applications and integrations.
+    """
+    # First, run the standard parse
+    raw_response = await parse(file, return_visual=False, lang=lang)
+    
+    # Convert Pydantic model to dict
+    if hasattr(raw_response, 'model_dump'):
+        ocr_dict = raw_response.model_dump()
+    elif hasattr(raw_response, 'dict'):
+        ocr_dict = raw_response.dict()
+    else:
+        ocr_dict = dict(raw_response)
+    
+    # Transform to structured format
+    structured_response = transform_invoice(ocr_dict)
+    
+    return structured_response
 
 
 if __name__ == "__main__":

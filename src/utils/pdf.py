@@ -1,7 +1,7 @@
 import io
 import numpy as np
 from PIL import Image
-import pdfplumber
+import pypdfium2 as pdfium
 import cv2
 import sys
 import os
@@ -16,10 +16,12 @@ def rasterize_pdf_if_needed(raw: bytes, content_type: str):
         img = Image.open(io.BytesIO(raw)).convert("RGB")
         return [cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)]
     
-    pages = []
-    with pdfplumber.open(io.BytesIO(raw)) as pdf:
-        for i, page in enumerate(pdf.pages[:config.MAX_PAGES]):
-            pil = page.to_image(resolution=300).original
-            pages.append(cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR))
-    return pages
+    pdf = pdfium.PdfDocument(io.BytesIO(raw))
+    scale = 300/72.0  # ~300 DPI
+    pages_bgr = []
+    for i in range(min(len(pdf), config.MAX_PAGES)):
+        page = pdf[i]
+        pil_img = page.render(scale=scale, rotation=0).to_pil()
+        pages_bgr.append(cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR))
+    return pages_bgr
 

@@ -14,3 +14,12 @@ MAX_GLARE = float(os.getenv("MAX_GLARE", "0.08"))
 REJECT_IF_BAD_QUALITY = os.getenv("REJECT_IF_BAD_QUALITY", "true").lower() == "true"
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
+# PP-Structure settings
+USE_PP_STRUCTURE = os.getenv("USE_PP_STRUCTURE", "true").lower() == "true"
+TABLE_STRUCTURE_MODEL = os.getenv("TABLE_STRUCTURE_MODEL", "en")
+
+# Handwriting detection settings
+ENABLE_HANDWRITING_DETECTION = os.getenv("ENABLE_HANDWRITING_DETECTION", "true").lower() == "true"
+HANDWRITING_THRESHOLD = float(os.getenv("HANDWRITING_THRESHOLD", "0.6"))
+TROCR_MODEL = os.getenv("TROCR_MODEL", "microsoft/trocr-base-handwritten")
+

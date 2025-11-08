@@ -49,20 +49,44 @@ def generate_warnings(header, rows, quality):
     return warnings
 
 
-def build_response(header, table, quality, hashes, raw_bytes=None, image_bgr=None):
+def build_response(header, table, quality, hashes, raw_bytes=None, image_bgr=None, extracted_totals=None):
     """Build the final OCR response."""
     rows = table.get("rows", [])
     
-    # Recompute totals
-    totals_dict = recompute_and_summarize(rows)
+    # Recompute totals from line items
+    computed_totals = recompute_and_summarize(rows)
     
-    # Split tax breakdown
-    place_of_supply = header.get("invoice", {}).get("placeOfSupply")
-    totals_dict = split_tax_breakdown(totals_dict, place_of_supply)
+    # Map "taxable" to "net" in extracted_totals for consistency
+    if extracted_totals and "taxable" in extracted_totals:
+        extracted_totals["net"] = extracted_totals["taxable"]
     
-    # Reconcile with extracted totals (if available)
-    extracted_totals = {}  # Could be extracted from tokens
-    reconciled, round_off = reconcile_totals(totals_dict, extracted_totals)
+    # Use extracted totals if available (from page 2), otherwise use computed
+    # Extracted totals are more accurate as they come directly from the document
+    if extracted_totals:
+        totals_dict = {
+            "net": extracted_totals.get("net", computed_totals["net"]),
+            "tax": extracted_totals.get("tax", computed_totals["tax"]),
+            "gross": extracted_totals.get("gross", computed_totals["gross"]),
+            "cgst": extracted_totals.get("cgst", 0.0),
+            "sgst": extracted_totals.get("sgst", 0.0),
+            "igst": extracted_totals.get("igst", 0.0)
+        }
+        
+        # If tax breakdown not in extracted, split from total tax
+        if not any(k in extracted_totals for k in ["cgst", "sgst", "igst"]):
+            place_of_supply = header.get("invoice", {}).get("placeOfSupply")
+            totals_dict = split_tax_breakdown(totals_dict, place_of_supply)
+    else:
+        # No extracted totals, use computed and split tax
+        place_of_supply = header.get("invoice", {}).get("placeOfSupply")
+        totals_dict = split_tax_breakdown(computed_totals, place_of_supply)
+    
+    # Reconcile: compare computed vs extracted to find discrepancies
+    reconciled, round_off = reconcile_totals(computed_totals, extracted_totals or {})
+    
+    # Use extracted round_off if available, otherwise use computed delta
+    if extracted_totals and "round_off" in extracted_totals:
+        round_off = extracted_totals["round_off"]
     
     # Build totals info
     totals_info = TotalsInfo(
@@ -106,6 +130,7 @@ def build_response(header, table, quality, hashes, raw_bytes=None, image_bgr=Non
     seller = EntityInfo(
         name=seller_data.get("name"),
         gstin=seller_data.get("gstin"),
+        address=seller_data.get("address"),
         confidence=seller_data.get("confidence", 0.0),
         bbox=seller_data.get("bbox")
     ) if seller_data.get("name") or seller_data.get("gstin") else None
@@ -113,6 +138,7 @@ def build_response(header, table, quality, hashes, raw_bytes=None, image_bgr=Non
     buyer = EntityInfo(
         name=buyer_data.get("name"),
         gstin=buyer_data.get("gstin"),
+        address=buyer_data.get("address"),
         confidence=buyer_data.get("confidence", 0.0),
         bbox=buyer_data.get("bbox")
     ) if buyer_data.get("name") or buyer_data.get("gstin") else None
@@ -146,6 +172,19 @@ def build_response(header, table, quality, hashes, raw_bytes=None, image_bgr=Non
             return obj.__dict__
         return obj
     
+    # Extract full text from all tokens
+    from ..schemas import FullTextToken
+    all_tokens = header.get("allTokens", [])
+    full_text_tokens = []
+    for token in all_tokens:
+        full_text_tokens.append(FullTextToken(
+            text=token.get("text", ""),
+            confidence=token.get("conf", 0.0),
+            bbox=token.get("bbox", []),
+            handwritten=token.get("handwritten"),
+            hw_score=token.get("hw_score")
+        ))
+    
     return {
         "meta": to_dict(meta),
         "seller": to_dict(seller),
@@ -153,6 +192,7 @@ def build_response(header, table, quality, hashes, raw_bytes=None, image_bgr=Non
         "invoice": to_dict(invoice),
         "lines": [to_dict(r) for r in rows],
         "totals": to_dict(totals_info),
-        "warnings": [to_dict(w) for w in warnings]
+        "warnings": [to_dict(w) for w in warnings],
+        "fullText": [to_dict(t) for t in full_text_tokens]
     }
 
